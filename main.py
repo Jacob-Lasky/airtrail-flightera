@@ -4,6 +4,7 @@ from dotenv import load_dotenv
 import json
 import argparse
 import logging
+import traceback
 from datetime import datetime
 from selenium import webdriver
 from selenium.webdriver.firefox.service import Service as FirefoxService
@@ -13,6 +14,16 @@ from bs4 import BeautifulSoup
 import pytz
 
 load_dotenv()
+
+# Suppress verbose logs from webdriver-manager
+os.environ['WDM_LOG'] = '0'
+
+# Custom Exceptions for logical failures
+class DataMismatchError(Exception):
+    pass
+
+class MissingDataError(Exception):
+    pass
 
 def find_flight(flights, flight_number, departure_date, departing_airport):
     """
@@ -119,6 +130,8 @@ def main():
     # Configure logging
     log_level = logging.DEBUG if args.verbose else logging.INFO
     logging.basicConfig(level=log_level, format='%(asctime)s - %(levelname)s - %(message)s')
+    # Suppress verbose logs from webdriver-manager
+    logging.getLogger('webdriver_manager').setLevel(logging.WARNING)
 
     base_url = os.getenv('AIRTRAIL_BASE_URL')
     api_key = os.getenv('AIRTRAIL_API_KEY')
@@ -167,14 +180,25 @@ def scrape_flightera_info(flight_data, base_url, headers):
             logging.info(f"Skipping future flight on {departure_date_str}.")
             return
 
-    logging.info("--- Scraping Flightera.net with Selenium ---")
-    airline_name = flight_data.get('airline', {}).get('name')
-    flight_number = flight_data.get('flightNumber')
-    departure_date_str = flight_data.get('date')
+    # --- Skip if data is already complete ---
+    aircraft_data = flight_data.get('aircraft')
+    aircraft_present = isinstance(aircraft_data, dict) and aircraft_data.get('icao') or isinstance(aircraft_data, str)
+    reg_present = bool(flight_data.get('aircraftReg'))
+    note_present = "Flightera:" in (flight_data.get('note') or "")
 
-    if not all([airline_name, flight_number, departure_date_str]):
-        logging.warning("Could not scrape: Missing airline, flight number, or date information.")
+    if aircraft_present and reg_present and note_present:
+        logging.info("Skipping scrape: Flight data appears to be complete.")
         return
+
+    logging.info("--- Scraping Flightera.net with Selenium ---")
+    airline_data = flight_data.get('airline')
+    if not airline_data or not airline_data.get('name'):
+        raise MissingDataError(f"Flight ID {flight_data.get('id')} has a null or invalid airline name.")
+    airline_name = airline_data.get('name')
+    flight_number = flight_data.get('flightNumber')
+
+    if not all([flight_number, departure_date_str]):
+        raise MissingDataError("Flight is missing a flight number or departure date.")
 
     try:
         departure_date = datetime.strptime(departure_date_str, "%Y-%m-%d")
@@ -212,12 +236,14 @@ def scrape_flightera_info(flight_data, base_url, headers):
             scraped_airline = scraped_data.get('scraped_airline', '').strip()
             scraped_flight_num = scraped_data.get('scraped_flight_number', '').strip()
 
-            if (original_airline.lower() != scraped_airline.lower() or original_flight_num.lower() != scraped_flight_num.lower()):
-                logging.warning("--- WARNING: Data Mismatch Detected (likely a codeshare) ---")
-                logging.warning(f"Original: {original_airline} {original_flight_num}")
-                logging.warning(f"Scraped:  {scraped_airline} {scraped_flight_num}")
-                logging.warning("Update skipped to prevent incorrect data merge.")
-                return
+            # Flexible airline matching (e.g., "Frontier" vs "Frontier Airlines")
+            original_airline_lower = original_airline.lower()
+            scraped_airline_lower = scraped_airline.lower()
+            airline_match = (original_airline_lower in scraped_airline_lower) or (scraped_airline_lower in original_airline_lower)
+            flight_num_match = original_flight_num.lower() == scraped_flight_num.lower()
+
+            if not (airline_match and flight_num_match):
+                raise DataMismatchError(f"Original: {original_airline} {original_flight_num} | Scraped: {scraped_airline} {scraped_flight_num}")
 
             update_flight(flight_data, scraped_data, base_url, headers)
 
@@ -437,6 +463,7 @@ def process_all_flights(base_url, headers):
                 'flight_id': flight_id,
                 'flight_data': flight,
                 'error_message': str(e),
+                'traceback': traceback.format_exc(),
                 'timestamp': datetime.now().isoformat()
             })
 
