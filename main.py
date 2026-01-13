@@ -170,7 +170,19 @@ def scrape_flightera_info(flight_data, base_url, headers):
         scraped_data = parse_flight_html(html_content, departure_date_str)
 
         if scraped_data:
-            # Pass the original flight data, not the nested one, to the update function
+            # --- Validation Step ---
+            original_airline = flight_data.get('airline', {}).get('name', '').strip()
+            original_flight_num = flight_data.get('flightNumber', '').strip()
+            scraped_airline = scraped_data.get('scraped_airline', '').strip()
+            scraped_flight_num = scraped_data.get('scraped_flight_number', '').strip()
+
+            if (original_airline.lower() != scraped_airline.lower() or original_flight_num.lower() != scraped_flight_num.lower()):
+                print("\n--- WARNING: Data Mismatch Detected (likely a codeshare) ---")
+                print(f"Original: {original_airline} {original_flight_num}")
+                print(f"Scraped:  {scraped_airline} {scraped_flight_num}")
+                print("Update skipped to prevent incorrect data merge.")
+                return
+
             update_flight(flight_data, scraped_data, base_url, headers)
 
     except Exception as e:
@@ -219,9 +231,18 @@ def parse_flight_html(html, target_date_str):
             departure_status = status_spans[1].text.strip() if len(status_spans) > 1 else None
             arrival_status = status_spans[2].text.strip() if len(status_spans) > 2 else None
 
-            # Details URL
+            # Details URL and validation data from it
             details_tag = container.find('a', href=lambda h: h and 'flight_details' in h)
             details_url = f"https://www.flightera.net{details_tag['href']}" if details_tag else None
+            scraped_airline = None
+            scraped_flight_number = None
+            if details_url:
+                url_parts = details_url.split('/')
+                if len(url_parts) > 6:
+                    scraped_flight_number = url_parts[-3]
+                    # Extract airline, replacing '+' with space
+                    airline_part = url_parts[-4].split('-')[0]
+                    scraped_airline = airline_part.replace('+', ' ')
 
             scraped_data = {
                 "aircraft_name": aircraft_name,
@@ -229,7 +250,9 @@ def parse_flight_html(html, target_date_str):
                 "aircraft_reg": aircraft_reg,
                 "departure_status": departure_status,
                 "arrival_status": arrival_status,
-                "details_url": details_url
+                "details_url": details_url,
+                "scraped_airline": scraped_airline,
+                "scraped_flight_number": scraped_flight_number
             }
             print(f"\n--- Scraped Flight Details ---")
             print(json.dumps(scraped_data, indent=2))
