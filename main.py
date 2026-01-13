@@ -12,6 +12,7 @@ from webdriver_manager.firefox import GeckoDriverManager
 from selenium.webdriver.firefox.options import Options
 from bs4 import BeautifulSoup
 import pytz
+import atexit
 
 load_dotenv()
 
@@ -24,6 +25,22 @@ class DataMismatchError(Exception):
 
 class MissingDataError(Exception):
     pass
+
+class ScrapingFlightNotFoundError(Exception):
+    pass
+
+# --- Global WebDriver Singleton ---
+driver = None
+
+def quit_driver():
+    """Quits the WebDriver if it's running."""
+    global driver
+    if driver:
+        logging.info("Shutting down Selenium WebDriver...")
+        driver.quit()
+        driver = None
+
+atexit.register(quit_driver)
 
 def find_flight(flights, flight_number, departure_date, departing_airport):
     """
@@ -212,20 +229,19 @@ def scrape_flightera_info(flight_data, base_url, headers):
     url = f"https://www.flightera.net/en/flight/{airline_formatted}/{flight_num_formatted}/{month_year}#flight_list"
     logging.debug(f"Scraping URL: {url}")
 
-    # Setup headless Firefox browser with Selenium
-    firefox_options = Options()
-    firefox_options.add_argument("--headless")
-    
+    global driver
     try:
-        service = FirefoxService(GeckoDriverManager().install())
-        driver = webdriver.Firefox(service=service, options=firefox_options)
-        
+        # Initialize driver if it hasn't been already
+        if driver is None:
+            logging.info("Initializing Selenium WebDriver for the first time...")
+            firefox_options = Options()
+            firefox_options.add_argument("--headless")
+            service = FirefoxService(GeckoDriverManager().install())
+            driver = webdriver.Firefox(service=service, options=firefox_options)
+
         logging.debug("Fetching page with Selenium...")
         driver.get(url)
-        
-        # Let the page load completely
-        driver.implicitly_wait(5) 
-
+        driver.implicitly_wait(5)
         html_content = driver.page_source
         scraped_data = parse_flight_html(html_content, departure_date_str)
 
@@ -248,10 +264,9 @@ def scrape_flightera_info(flight_data, base_url, headers):
             update_flight(flight_data, scraped_data, base_url, headers)
 
     except Exception as e:
-        logging.error(f"An error occurred while scraping with Selenium: {e}")
-    finally:
-        if 'driver' in locals() and driver:
-            driver.quit()
+        logging.error(f"An error occurred during scraping: {e}", exc_info=True)
+        # Re-raise to be caught by the main processing loop
+        raise
 
 def parse_flight_html(html, target_date_str):
     """
@@ -320,8 +335,7 @@ def parse_flight_html(html, target_date_str):
             logging.debug(json.dumps(scraped_data, indent=2))
             return scraped_data
 
-    logging.warning("Could not find matching flight details in the scraped HTML.")
-    return None
+    raise ScrapingFlightNotFoundError("Could not find matching flight details in the scraped HTML.")
 
 def update_flight(original_flight, scraped_data, base_url, headers):
     """
