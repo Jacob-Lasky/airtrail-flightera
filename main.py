@@ -3,6 +3,7 @@ import os
 from dotenv import load_dotenv
 import json
 import argparse
+import logging
 from datetime import datetime
 from selenium import webdriver
 from selenium.webdriver.firefox.service import Service as FirefoxService
@@ -112,12 +113,17 @@ def main():
     parser.add_argument('--date', help='The departure date for the search (YYYY-MM-DD).')
     parser.add_argument('--airport', help='Departure airport ICAO code for searching.')
     parser.add_argument('--all', action='store_true', help='Process all flights in the database.')
+    parser.add_argument('-v', '--verbose', action='store_true', help='Enable detailed debug logging.')
     args = parser.parse_args()
+
+    # Configure logging
+    log_level = logging.DEBUG if args.verbose else logging.INFO
+    logging.basicConfig(level=log_level, format='%(asctime)s - %(levelname)s - %(message)s')
 
     base_url = os.getenv('AIRTRAIL_BASE_URL')
     api_key = os.getenv('AIRTRAIL_API_KEY')
     if not api_key or not base_url:
-        print("Error: AIRTRAIL_BASE_URL and AIRTRAIL_API_KEY must be set in .env file.")
+        logging.error("AIRTRAIL_BASE_URL and AIRTRAIL_API_KEY must be set in .env file.")
         return
 
     headers = {"Authorization": f"Bearer {api_key}"}
@@ -125,30 +131,29 @@ def main():
     if args.all:
         process_all_flights(base_url, headers)
     elif args.id:
-        print(f"--- Processing single flight by ID: {args.id} ---")
+        logging.info(f"--- Processing single flight by ID: {args.id} ---")
         try:
-            # Correct endpoint: /api/flight/get/{id}
             response = requests.get(f"{base_url}/api/flight/get/{args.id}", headers=headers)
             response.raise_for_status()
             flight_data = response.json().get('flight')
             if flight_data:
                 scrape_flightera_info(flight_data, base_url, headers)
             else:
-                print("Flight not found.")
+                logging.warning("Flight not found.")
         except Exception as e:
-            print(f"An error occurred while processing flight ID {args.id}: {e}")
+            logging.error(f"An error occurred while processing flight ID {args.id}: {e}")
     elif args.flight_number and args.date and args.airport:
-        print(f"--- Searching for flight: {args.flight_number} on {args.date} at {args.airport} ---")
+        logging.info(f"--- Searching for flight: {args.flight_number} on {args.date} at {args.airport} ---")
         all_flights = get_all_flights(base_url, headers)
         if all_flights:
             found_flight = find_flight(all_flights, args.flight_number, args.date, args.airport)
             if found_flight:
-                print(f"Found matching flight with ID: {found_flight.get('id')}")
+                logging.info(f"Found matching flight with ID: {found_flight.get('id')}")
                 scrape_flightera_info(found_flight, base_url, headers)
             else:
-                print("Flight not found with the specified criteria.")
+                logging.warning("Flight not found with the specified criteria.")
     else:
-        print("No action specified. Use --id, --all, or a full search (--flight-number, --date, --airport).")
+        logging.info("No action specified. Use --id, --all, or a full search (--flight-number, --date, --airport).")
 
 def scrape_flightera_info(flight_data, base_url, headers):
     """
@@ -159,29 +164,29 @@ def scrape_flightera_info(flight_data, base_url, headers):
     if departure_date_str:
         flight_date = datetime.strptime(departure_date_str, "%Y-%m-%d").date()
         if flight_date > datetime.now().date():
-            print(f"Skipping future flight on {departure_date_str}.")
+            logging.info(f"Skipping future flight on {departure_date_str}.")
             return
 
-    print("\n--- Scraping Flightera.net with Selenium ---")
+    logging.info("--- Scraping Flightera.net with Selenium ---")
     airline_name = flight_data.get('airline', {}).get('name')
     flight_number = flight_data.get('flightNumber')
     departure_date_str = flight_data.get('date')
 
     if not all([airline_name, flight_number, departure_date_str]):
-        print("Could not scrape: Missing airline, flight number, or date information.")
+        logging.warning("Could not scrape: Missing airline, flight number, or date information.")
         return
 
     try:
         departure_date = datetime.strptime(departure_date_str, "%Y-%m-%d")
         month_year = departure_date.strftime("%b-%Y")
     except ValueError:
-        print(f"Could not scrape: Invalid date format '{departure_date_str}'.")
+        logging.warning(f"Could not scrape: Invalid date format '{departure_date_str}'.")
         return
 
     airline_formatted = airline_name.replace(" ", "+")
     flight_num_formatted = flight_number.replace(" ", "")
     url = f"https://www.flightera.net/en/flight/{airline_formatted}/{flight_num_formatted}/{month_year}#flight_list"
-    print(f"Scraping URL: {url}")
+    logging.debug(f"Scraping URL: {url}")
 
     # Setup headless Firefox browser with Selenium
     firefox_options = Options()
@@ -191,7 +196,7 @@ def scrape_flightera_info(flight_data, base_url, headers):
         service = FirefoxService(GeckoDriverManager().install())
         driver = webdriver.Firefox(service=service, options=firefox_options)
         
-        print("Fetching page with Selenium...")
+        logging.debug("Fetching page with Selenium...")
         driver.get(url)
         
         # Let the page load completely
@@ -208,16 +213,16 @@ def scrape_flightera_info(flight_data, base_url, headers):
             scraped_flight_num = scraped_data.get('scraped_flight_number', '').strip()
 
             if (original_airline.lower() != scraped_airline.lower() or original_flight_num.lower() != scraped_flight_num.lower()):
-                print("\n--- WARNING: Data Mismatch Detected (likely a codeshare) ---")
-                print(f"Original: {original_airline} {original_flight_num}")
-                print(f"Scraped:  {scraped_airline} {scraped_flight_num}")
-                print("Update skipped to prevent incorrect data merge.")
+                logging.warning("--- WARNING: Data Mismatch Detected (likely a codeshare) ---")
+                logging.warning(f"Original: {original_airline} {original_flight_num}")
+                logging.warning(f"Scraped:  {scraped_airline} {scraped_flight_num}")
+                logging.warning("Update skipped to prevent incorrect data merge.")
                 return
 
             update_flight(flight_data, scraped_data, base_url, headers)
 
     except Exception as e:
-        print(f"An error occurred while scraping with Selenium: {e}")
+        logging.error(f"An error occurred while scraping with Selenium: {e}")
     finally:
         if 'driver' in locals() and driver:
             driver.quit()
@@ -227,7 +232,7 @@ def parse_flight_html(html, target_date_str):
     Parses the Flightera HTML to find and extract details for a specific flight date.
     Returns a dictionary with the scraped data, or None if not found.
     """
-    print("\n--- Parsing Scraped Flight Data ---")
+    logging.info("--- Parsing Scraped Flight Data ---")
     soup = BeautifulSoup(html, 'lxml')
     target_date_obj = datetime.strptime(target_date_str, "%Y-%m-%d")
     flight_containers = soup.find_all('div', class_='flex flex-col gap-3')
@@ -285,18 +290,18 @@ def parse_flight_html(html, target_date_str):
                 "scraped_airline": scraped_airline,
                 "scraped_flight_number": scraped_flight_number
             }
-            print(f"\n--- Scraped Flight Details ---")
-            print(json.dumps(scraped_data, indent=2))
+            logging.info("--- Scraped Flight Details ---")
+            logging.debug(json.dumps(scraped_data, indent=2))
             return scraped_data
 
-    print("Could not find matching flight details in the scraped HTML.")
+    logging.warning("Could not find matching flight details in the scraped HTML.")
     return None
 
 def update_flight(original_flight, scraped_data, base_url, headers):
     """
     Updates the flight in the database with new information.
     """
-    print("\n--- Preparing Flight Update ---")
+    logging.info("--- Preparing Flight Update ---")
     
     # Start with a full copy of the original flight data to preserve all fields.
     payload = original_flight.copy()
@@ -330,12 +335,12 @@ def update_flight(original_flight, scraped_data, base_url, headers):
     # --- Conditionally update scraped data ---
     if not payload.get('aircraft') and scraped_data.get('aircraft_icao'):
         payload['aircraft'] = scraped_data['aircraft_icao']
-        print(f"Adding Aircraft ICAO: {scraped_data['aircraft_icao']}")
+        logging.info(f"Adding Aircraft ICAO: {scraped_data['aircraft_icao']}")
         is_updated = True
 
     if not payload.get('aircraftReg') and scraped_data.get('aircraft_reg'):
         payload['aircraftReg'] = scraped_data['aircraft_reg']
-        print(f"Adding Registration: {scraped_data['aircraft_reg']}")
+        logging.info(f"Adding Registration: {scraped_data['aircraft_reg']}")
         is_updated = True
 
     new_notes = []
@@ -366,7 +371,7 @@ def update_flight(original_flight, scraped_data, base_url, headers):
             payload['note'] = new_note_section
 
         payload.pop('notes', None)  # Clean up old plural key
-        print(f"Updating Note:\n{payload['note']}")
+        logging.info(f"Updating Note:\n{payload['note']}")
         is_updated = True
 
     # Clean up unnecessary fields that are not part of the save API schema
@@ -374,39 +379,37 @@ def update_flight(original_flight, scraped_data, base_url, headers):
         payload.pop(key, None)
 
     if not is_updated:
-        print("No new information to update.")
+        logging.info("No new information to update.")
         return
 
-    # Send the update request
     update_url = f"{base_url}/api/flight/save"
     try:
-        print(f"Sending update to {update_url}")
+        logging.debug(f"Sending update to {update_url}")
+        logging.debug(f"Update payload:\n{json.dumps(payload, indent=2)}")
         response = requests.post(update_url, headers=headers, json=payload)
         response.raise_for_status()
-        print("\n--- Update Successful ---")
-        print(json.dumps(payload, indent=2))
-        print(json.dumps(response.json(), indent=2))
+        logging.info("--- Update Successful ---")
+        logging.debug(f"Response body:\n{json.dumps(response.json(), indent=2)}")
     except requests.exceptions.RequestException as e:
-        print(f"\nError updating flight: {e}")
+        logging.error(f"Error updating flight: {e}")
         if e.response is not None:
-            print(f"Response Body: {e.response.text}")
-        print(json.dumps(payload, indent=2))
+            logging.error(f"Response Body: {e.response.text}")
+        logging.error(f"Failed payload:\n{json.dumps(payload, indent=2)}")
 
 def get_all_flights(base_url, headers):
     """
     Fetches all flights from the database.
     """
-    # Correct endpoint: /api/flight/list
     url = f"{base_url}/api/flight/list"
-    print(f"Fetching all flights from {url}...")
+    logging.info(f"Fetching all flights from {url}...")
     try:
         response = requests.get(url, headers=headers)
         response.raise_for_status()
         return response.json().get('flights', [])
     except requests.exceptions.RequestException as e:
-        print(f"Error fetching all flights: {e}")
+        logging.error(f"Error fetching all flights: {e}")
     except json.JSONDecodeError:
-        print("Error: Failed to decode JSON response when fetching all flights.")
+        logging.error("Error: Failed to decode JSON response when fetching all flights.")
     return []
 
 def process_all_flights(base_url, headers):
@@ -415,21 +418,21 @@ def process_all_flights(base_url, headers):
     """
     all_flights = get_all_flights(base_url, headers)
     if not all_flights:
-        print("No flights to process.")
+        logging.info("No flights to process.")
         return
 
     error_log = []
     total_flights = len(all_flights)
-    print(f"Found {total_flights} flights to process.")
+    logging.info(f"Found {total_flights} flights to process.")
 
     for i, flight in enumerate(all_flights):
         flight_id = flight.get('id')
         flight_num = flight.get('flightNumber')
-        print(f"\n--- ({i+1}/{total_flights}) Processing Flight ID: {flight_id}, Number: {flight_num} ---")
+        logging.info(f"--- ({i+1}/{total_flights}) Processing Flight ID: {flight_id}, Number: {flight_num} ---")
         try:
             scrape_flightera_info(flight, base_url, headers)
         except Exception as e:
-            print(f"An unexpected error occurred while processing flight ID {flight_id}: {e}")
+            logging.error(f"An unexpected error occurred while processing flight ID {flight_id}: {e}", exc_info=True)
             error_log.append({
                 'flight_id': flight_id,
                 'flight_data': flight,
@@ -438,13 +441,13 @@ def process_all_flights(base_url, headers):
             })
 
     if error_log:
-        print(f"\n--- Processing Complete with {len(error_log)} Errors ---")
+        logging.warning(f"--- Processing Complete with {len(error_log)} Errors ---")
         error_file = 'flight_processing_errors.json'
         with open(error_file, 'w') as f:
             json.dump(error_log, f, indent=2)
-        print(f"Errors have been logged to {error_file}")
+        logging.warning(f"Errors have been logged to {error_file}")
     else:
-        print("\n--- Processing Complete: All flights processed successfully! ---")
+        logging.info("--- Processing Complete: All flights processed successfully! ---")
 
 if __name__ == "__main__":
     main()
