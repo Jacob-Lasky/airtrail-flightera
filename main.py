@@ -15,38 +15,41 @@ load_dotenv()
 
 def find_flight(flights, flight_number, departure_date, departing_airport):
     """
-    Searches for a specific flight in a list of flights.
-
-    Args:
-        flights: A list of flight dictionaries.
-        flight_number: The flight number to search for (e.g., "DL3181").
-        departure_date: The departure date in "YYYY-MM-DD" format.
-        departing_airport: The IATA or ICAO code of the departing airport.
-
-    Returns:
-        A dictionary containing the flight data if found, otherwise None.
+    Searches for a specific flight in a list of flights, accounting for timezones.
     """
-    normalized_flight_number = flight_number.replace(" ", "").upper()
-    normalized_departing_airport = departing_airport.upper()
+    search_flight_num = flight_number.replace(" ", "").lower()
+    search_airport = departing_airport.lower()
+    search_date_obj = datetime.strptime(departure_date, "%Y-%m-%d").date()
 
     for flight in flights:
-        # Handle cases where flightNumber is explicitly None in the data
-        flight_num_raw = flight.get('flightNumber')
-        current_flight_number = flight_num_raw.replace(" ", "").upper() if flight_num_raw else ""
+        flight_number_val = flight.get('flightNumber')
+        if not flight_number_val:
+            continue
 
-        from_data = flight.get('from', {})
-        iata = from_data.get('iata')
-        icao = from_data.get('icao')
+        flight_num = flight_number_val.replace(" ", "").lower()
+        from_airport_icao = flight.get('from', {}).get('icao', '').lower()
+        from_airport_iata = flight.get('from', {}).get('iata', '').lower()
 
-        if (
-            current_flight_number == normalized_flight_number and
-            flight.get('date') == departure_date and
-            (
-                (iata and iata.upper() == normalized_departing_airport) or
-                (icao and icao.upper() == normalized_departing_airport)
-            )
-        ):
+        # Timezone-aware date comparison
+        departure_utc_str = flight.get('departure')
+        local_tz_str = flight.get('from', {}).get('tz')
+
+        if not (departure_utc_str and local_tz_str):
+            continue  # Skip if we don't have enough info
+
+        try:
+            utc_dt = datetime.fromisoformat(departure_utc_str.replace('Z', '+00:00'))
+            local_tz = pytz.timezone(local_tz_str)
+            local_dt = utc_dt.astimezone(local_tz)
+            flight_local_date = local_dt.date()
+        except (ValueError, pytz.UnknownTimeZoneError):
+            continue # Skip if date/tz is invalid
+
+        if (flight_num == search_flight_num and
+            flight_local_date == search_date_obj and
+            (from_airport_icao == search_airport or from_airport_iata == search_airport)):
             return flight
+            
     return None
 
 def get_flight_by_id(flight_id, base_url, headers):
@@ -65,72 +68,100 @@ def get_flight_by_id(flight_id, base_url, headers):
         print("Error: Failed to decode JSON response.")
         return None
 
+def process_all_flights(base_url, headers):
+    """
+    Fetches all flights from the API and processes them.
+    """
+    all_flights_url = f"{base_url}/api/flight/list"
+    try:
+        response = requests.get(all_flights_url, headers=headers)
+        response.raise_for_status()
+        flights = response.json()
+    except requests.exceptions.RequestException as e:
+        print(f"Error fetching all flights: {e}")
+        return
+    except json.JSONDecodeError:
+        print("Error: Failed to decode JSON response from the server.")
+        return
+
+    if isinstance(flights, dict) and 'flights' in flights:
+        all_flights = flights['flights']
+    else:
+        print("Error: Unexpected JSON response format. 'flights' key not found.")
+        return
+
+    failures = []
+    for flight in all_flights:
+        try:
+            scrape_flightera_info(flight, base_url, headers)
+        except Exception as e:
+            failures.append({
+                'flight': flight,
+                'error': str(e)
+            })
+
+    if failures:
+        with open('flight_scraping_failures.json', 'w') as f:
+            json.dump(failures, f, indent=2)
+        print("Flight scraping failures logged to flight_scraping_failures.json")
+
 def main():
-    parser = argparse.ArgumentParser(description="Search for a flight in the Airtrail database.")
-    parser.add_argument('--id', type=int, help='The unique ID of the flight to fetch directly.')
-    parser.add_argument('--flight-number', help='The flight number to search for (e.g., \"DL 5450\").')
+    parser = argparse.ArgumentParser(description="Scrape flight data and update the Airtrail database.")
+    parser.add_argument('--id', type=int, help='The unique ID of a specific flight to process.')
+    parser.add_argument('--flight-number', help='The flight number to search for.')
     parser.add_argument('--date', help='The departure date for the search (YYYY-MM-DD).')
-    parser.add_argument('--airport', help='The departing airport IATA/ICAO code for the search.')
+    parser.add_argument('--airport', help='Departure airport ICAO code for searching.')
+    parser.add_argument('--all', action='store_true', help='Process all flights in the database.')
     args = parser.parse_args()
 
-    search_params_present = args.flight_number and args.date and args.airport
-    if not args.id and not search_params_present:
-        parser.error('Either --id or all of --flight-number, --date, and --airport are required.')
+    base_url = os.getenv('AIRTRAIL_BASE_URL')
+    api_key = os.getenv('AIRTRAIL_API_KEY')
+    if not api_key or not base_url:
+        print("Error: AIRTRAIL_BASE_URL and AIRTRAIL_API_KEY must be set in .env file.")
+        return
 
-    api_key = os.getenv("AIRTRAIL_API_KEY")
-    base_url = os.getenv("AIRTRAIL_BASE_URL")
-    if not api_key:
-        print("AIRTRAIL_API_KEY not found.")
-        return False
-    if not base_url:
-        print("AIRTRAIL_BASE_URL not found.")
-        return False
+    headers = {"Authorization": f"Bearer {api_key}"}
 
-    headers = {
-        "Authorization": f"Bearer {api_key}"
-    }
-
-    found_flight = None
-
-    if args.id:
-        print(f"Fetching flight with ID: {args.id}")
-        found_flight = get_flight_by_id(args.id, base_url, headers)
-    
-    elif search_params_present:
-        print(f"Searching for flight {args.flight_number} from {args.airport} on {args.date}")
-        all_flights_url = f"{base_url}/api/flight/list"
+    if args.all:
+        process_all_flights(base_url, headers)
+    elif args.id:
+        print(f"--- Processing single flight by ID: {args.id} ---")
         try:
-            response = requests.get(all_flights_url, headers=headers)
+            # Correct endpoint: /api/flight/get/{id}
+            response = requests.get(f"{base_url}/api/flight/get/{args.id}", headers=headers)
             response.raise_for_status()
-            json_response = response.json()
-            if isinstance(json_response, dict) and 'flights' in json_response:
-                all_flights = json_response['flights']
-                found_flight = find_flight(all_flights, args.flight_number, args.date, args.airport)
+            flight_data = response.json().get('flight')
+            if flight_data:
+                scrape_flightera_info(flight_data, base_url, headers)
             else:
-                print("Error: Unexpected JSON response format. 'flights' key not found.")
-                return
-        except requests.exceptions.RequestException as e:
-            print(f"Error fetching flight list: {e}")
-            return
-        except json.JSONDecodeError:
-            print("Error: Failed to decode JSON response from the server.")
-            return
-
-    if found_flight:
-        print("\n--- Flight Found! ---")
-        print(json.dumps(found_flight, indent=2))
-
-        flight_data_for_scraper = found_flight.get('flight') if 'success' in found_flight else found_flight
-        if flight_data_for_scraper:
-            scrape_flightera_info(flight_data_for_scraper, base_url, headers)
-
+                print("Flight not found.")
+        except Exception as e:
+            print(f"An error occurred while processing flight ID {args.id}: {e}")
+    elif args.flight_number and args.date and args.airport:
+        print(f"--- Searching for flight: {args.flight_number} on {args.date} at {args.airport} ---")
+        all_flights = get_all_flights(base_url, headers)
+        if all_flights:
+            found_flight = find_flight(all_flights, args.flight_number, args.date, args.airport)
+            if found_flight:
+                print(f"Found matching flight with ID: {found_flight.get('id')}")
+                scrape_flightera_info(found_flight, base_url, headers)
+            else:
+                print("Flight not found with the specified criteria.")
     else:
-        print("\nFlight not found.")
+        print("No action specified. Use --id, --all, or a full search (--flight-number, --date, --airport).")
 
 def scrape_flightera_info(flight_data, base_url, headers):
     """
     Scrapes Flightera.net for additional flight information using Selenium.
     """
+    # --- Fail Fast for Future Flights ---
+    departure_date_str = flight_data.get('date')
+    if departure_date_str:
+        flight_date = datetime.strptime(departure_date_str, "%Y-%m-%d").date()
+        if flight_date > datetime.now().date():
+            print(f"Skipping future flight on {departure_date_str}.")
+            return
+
     print("\n--- Scraping Flightera.net with Selenium ---")
     airline_name = flight_data.get('airline', {}).get('name')
     flight_number = flight_data.get('flightNumber')
@@ -316,15 +347,25 @@ def update_flight(original_flight, scraped_data, base_url, headers):
         new_notes.append(f"Flightera: {scraped_data['details_url']}")
 
     if new_notes:
-        existing_note = payload.get('note') or payload.get('notes') # Check both for safety
+        # Clean up old scraped data from the existing note to prevent bloat
+        existing_note = payload.get('note') or payload.get('notes')
+        cleaned_note_lines = []
         if existing_note:
-            # Format with separator
-            payload['note'] = f"{existing_note}\n----------\n" + "\n".join(new_notes)
-        else:
-            # Format without separator
-            payload['note'] = "\n".join(new_notes)
+            for line in existing_note.split('\n'):
+                if not line.strip().startswith(('Departure:', 'Arrival:', 'Flightera:', '----------')):
+                    cleaned_note_lines.append(line)
         
-        payload.pop('notes', None) # Clean up old plural key
+        # Join the cleaned original note
+        final_note = "\n".join(cleaned_note_lines).strip()
+
+        # Build the new note string
+        new_note_section = "\n".join(new_notes)
+        if final_note:
+            payload['note'] = f"{final_note}\n----------\n{new_note_section}"
+        else:
+            payload['note'] = new_note_section
+
+        payload.pop('notes', None)  # Clean up old plural key
         print(f"Updating Note:\n{payload['note']}")
         is_updated = True
 
@@ -350,6 +391,60 @@ def update_flight(original_flight, scraped_data, base_url, headers):
         if e.response is not None:
             print(f"Response Body: {e.response.text}")
         print(json.dumps(payload, indent=2))
+
+def get_all_flights(base_url, headers):
+    """
+    Fetches all flights from the database.
+    """
+    # Correct endpoint: /api/flight/list
+    url = f"{base_url}/api/flight/list"
+    print(f"Fetching all flights from {url}...")
+    try:
+        response = requests.get(url, headers=headers)
+        response.raise_for_status()
+        return response.json().get('flights', [])
+    except requests.exceptions.RequestException as e:
+        print(f"Error fetching all flights: {e}")
+    except json.JSONDecodeError:
+        print("Error: Failed to decode JSON response when fetching all flights.")
+    return []
+
+def process_all_flights(base_url, headers):
+    """
+    Processes all flights in the database, scraping and updating them.
+    """
+    all_flights = get_all_flights(base_url, headers)
+    if not all_flights:
+        print("No flights to process.")
+        return
+
+    error_log = []
+    total_flights = len(all_flights)
+    print(f"Found {total_flights} flights to process.")
+
+    for i, flight in enumerate(all_flights):
+        flight_id = flight.get('id')
+        flight_num = flight.get('flightNumber')
+        print(f"\n--- ({i+1}/{total_flights}) Processing Flight ID: {flight_id}, Number: {flight_num} ---")
+        try:
+            scrape_flightera_info(flight, base_url, headers)
+        except Exception as e:
+            print(f"An unexpected error occurred while processing flight ID {flight_id}: {e}")
+            error_log.append({
+                'flight_id': flight_id,
+                'flight_data': flight,
+                'error_message': str(e),
+                'timestamp': datetime.now().isoformat()
+            })
+
+    if error_log:
+        print(f"\n--- Processing Complete with {len(error_log)} Errors ---")
+        error_file = 'flight_processing_errors.json'
+        with open(error_file, 'w') as f:
+            json.dump(error_log, f, indent=2)
+        print(f"Errors have been logged to {error_file}")
+    else:
+        print("\n--- Processing Complete: All flights processed successfully! ---")
 
 if __name__ == "__main__":
     main()
