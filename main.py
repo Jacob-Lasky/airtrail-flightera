@@ -245,6 +245,18 @@ def scrape_flightera_info(flight_data, base_url, headers):
         html_content = driver.page_source
         scraped_data = parse_flight_html(html_content, departure_date_str)
 
+        if not scraped_data:
+            # To aid debugging, let's try to capture what was seen in the HTML
+            soup = BeautifulSoup(html_content, 'lxml')
+            flight_containers = soup.find_all('div', class_='flex flex-col gap-3')
+            seen_flights = []
+            for container in flight_containers:
+                date_tag = container.find('a', class_=lambda c: c and 'text-sm' in c)
+                airline_tag = container.find('a', class_=lambda c: c and 'text-base' in c)
+                if date_tag and airline_tag:
+                    seen_flights.append(f"{date_tag.text.strip()} - {airline_tag.text.strip()}")
+            raise ScrapingFlightNotFoundError(f"Could not find matching flight. Flights seen on page: {seen_flights}")
+
         if scraped_data:
             # --- Validation Step ---
             original_airline = flight_data.get('airline', {}).get('name', '').strip()
@@ -335,7 +347,8 @@ def parse_flight_html(html, target_date_str):
             logging.debug(json.dumps(scraped_data, indent=2))
             return scraped_data
 
-    raise ScrapingFlightNotFoundError("Could not find matching flight details in the scraped HTML.")
+    logging.warning("Could not find matching flight details in the scraped HTML.")
+    return None
 
 def update_flight(original_flight, scraped_data, base_url, headers):
     """
